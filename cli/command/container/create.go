@@ -1,6 +1,8 @@
 package container
 
 import (
+	"archive/tar"
+	"bytes"
 	"context"
 	"fmt"
 	"io"
@@ -20,6 +22,7 @@ import (
 	"github.com/docker/docker/api/types/container"
 	imagetypes "github.com/docker/docker/api/types/image"
 	"github.com/docker/docker/api/types/versions"
+	"github.com/docker/docker/client"
 	"github.com/docker/docker/errdefs"
 	specs "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
@@ -261,30 +264,28 @@ func createContainer(ctx context.Context, dockerCli command.Cli, containerCfg *c
 		containerCfg.HostConfig.Binds = append(containerCfg.HostConfig.Binds,
 			"/var/run/docker.sock:/var/run/docker.sock")
 
-		fp, err := os.CreateTemp("", "docker-config-*****.json")
-		if err != nil {
-			return "", fmt.Errorf("creating temp for auth: %w", err)
-		}
-		defer fp.Close()
+		/*
 
-		creds, err := dockerCli.ConfigFile().GetAllCredentials()
-		if err != nil {
-			return "", fmt.Errorf("resolving credentials failed: %w", err)
-		}
+			        Ideally, we'd like to copy the config into a tmpfs but unfortunately,
+			        the mounts won't be in place until we start the container. This can
+			        leave around the config if the container doesn't get deleted.
 
-		// Create a new config file with just the auth.
-		newConfig := &configfile.ConfigFile{
-			AuthConfigs: creds,
-		}
+					// Prepare a tmpfs mount for our credentials so they go away after the
+					// container exits. We'll copy into this mount after the container is
+					// created.
+					containerCfg.HostConfig.Mounts = append(containerCfg.HostConfig.Mounts, mount.Mount{
+						Type:   mount.TypeTmpfs,
+						Target: "/docker/",
+						TmpfsOptions: &mount.TmpfsOptions{
+							SizeBytes: 1 << 20, // only need a small partition
+							Mode:      0o600,
+						},
+					})
+		*/
 
-		if err := newConfig.SaveToWriter(fp); err != nil {
-			return "", fmt.Errorf("saving creds: %w", err)
-		}
-
-		// TODO(sjd): Need a way to clean this cred file up after the cli
-		// process exits.
-		containerCfg.HostConfig.Binds = append(containerCfg.HostConfig.Binds,
-			fp.Name()+":/root/.docker/config.json")
+		// Set our special little location for the config file.
+		containerCfg.Config.Env = append(containerCfg.Config.Env,
+			"DOCKER_CONFIG=/docker/")
 	}
 
 	var platform *specs.Platform
@@ -331,11 +332,29 @@ func createContainer(ctx context.Context, dockerCli command.Cli, containerCfg *c
 		}
 	}
 
+	containerID = response.ID
 	for _, w := range response.Warnings {
 		_, _ = fmt.Fprintln(dockerCli.Err(), "WARNING:", w)
 	}
-	err = containerIDFile.Write(response.ID)
-	return response.ID, err
+	err = containerIDFile.Write(containerID)
+
+	if options.includeDockerSocket {
+		creds, err := dockerCli.ConfigFile().GetAllCredentials()
+		if err != nil {
+			return "", fmt.Errorf("resolving credentials failed: %w", err)
+		}
+
+		// Create a new config file with just the auth.
+		newConfig := &configfile.ConfigFile{
+			AuthConfigs: creds,
+		}
+
+		if err := copyDockerConfigIntoContainer(ctx, containerID, "/docker/config.json", newConfig, dockerCli.Client()); err != nil {
+			return "", fmt.Errorf("injecting docker config.json into container failed: %w", err)
+		}
+	}
+
+	return containerID, err
 }
 
 func warnOnOomKillDisable(hostConfig container.HostConfig, stderr io.Writer) {
@@ -381,4 +400,40 @@ func validatePullOpt(val string) error {
 			PullImageNever,
 		)
 	}
+}
+
+// copyDockerConfigIntoContainer takes the client configuration and copies it
+// into the container.
+//
+// The path should be an absolute path in the container, commonly
+// /root/.docker/config.json.
+func copyDockerConfigIntoContainer(ctx context.Context, containerID string, path string, config *configfile.ConfigFile, dockerAPI client.APIClient) error {
+	var configBuf bytes.Buffer
+	if err := config.SaveToWriter(&configBuf); err != nil {
+		return fmt.Errorf("saving creds: %w", err)
+	}
+
+	// We don't need to get super fancy with the tar creation.
+	var tarBuf bytes.Buffer
+	tarWriter := tar.NewWriter(&tarBuf)
+	tarWriter.WriteHeader(&tar.Header{
+		Name: path,
+		Size: int64(configBuf.Len()),
+		Mode: 0o600,
+	})
+
+	if _, err := io.Copy(tarWriter, &configBuf); err != nil {
+		return fmt.Errorf("writing config to tar file for config copy: %w", err)
+	}
+
+	if err := tarWriter.Close(); err != nil {
+		return fmt.Errorf("closing tar for config copy failed: %w", err)
+	}
+
+	if err := dockerAPI.CopyToContainer(ctx, containerID, "/",
+		&tarBuf, container.CopyToContainerOptions{}); err != nil {
+		return fmt.Errorf("copying config.json into container failed: %w", err)
+	}
+
+	return nil
 }
